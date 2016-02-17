@@ -319,15 +319,150 @@ sub render_figure {
     MainLoop;
 }
 
+############################## DB utils using DBI ##############################
+package DB;
+use DBI;
+
+# Checking the presence of DBI module.
+if ( not eval { require DBI; } ) {
+    die "Error: 'DBI' module was not found. " .
+            "This program requiere 'DBI' module to run.\n"
+}
+
+# Data connection. Modify this information to use another DB.
+my $dbname   = 'perldb';
+my $hostname = 'localhost';
+my $port     = '3306';
+my $username = 'root';
+my $password = 'mysql';
+
+
+# Unable to connect to DB.
+my $dsn = "DBI:mysql:database=$dbname;host=$hostname;port=$port";
+my $dbh = DBI->connect($dsn, $username, $password, {'PrintError' => 0});
+if (not $dbh) {
+    die "Error: Unable to connect to DB: " . $DBI::errstr . "\n";
+}
+
+my $cmd = "
+CREATE TABLE IF NOT EXISTS figures (
+    id     SERIAL,
+    type   VARCHAR(10),
+    points TEXT, 
+    color  VARCHAR(10)
+);";
+
+if (not $dbh->do($cmd)) {
+    die "Error: Unable to execute command: " . $DBI::errstr . "\n";
+}
+
+my $exists_figure = sub {
+    my ($type, $points, $color) = @_;
+    my $sql = "SELECT id FROM figures
+            WHERE type='$type' AND points='$points' AND color='$color';";
+
+    my $sth = $dbh->prepare($sql);
+    $sth->execute() or die $sth->errstr . "\n";
+
+    if (my @row = $sth->fetchrow_array()) {
+        return $row[0];
+    }
+};
+
+sub save_figure {
+    my ($figure) = @_;
+    return if not blessed $figure;
+
+    my $type = blessed $figure;
+
+    my @points = $figure->points();
+    if ($type eq 'Rectangle' or $type eq 'Square') {
+        @points = ($points[0], $points[1], $points[4], $points[5]);
+    }
+    my $p_str = join ',', @points;
+
+    my $color = $figure->color();
+
+    my $id = $exists_figure->($type, $p_str, $color);
+    if ($id) {
+        die "Warning: This \"$type\" already exists in the DB with id \"$id\". " .
+                "Print \"render $id\" if you want to show it.\n";
+    }
+
+    my $rows_inserted = $dbh->do(
+            "INSERT INTO figures(type, points, color) VALUES (?, ?, ?);",
+            undef, $type, $p_str, $color);
+
+    if (not $rows_inserted) {
+        die "Error: Unable to insert to DB: " . $DBI::errstr . "\n";
+    }
+}
+
+sub drop_figure {
+    my $id = $_[0];
+    if (not defined $id) { return; }
+
+    my $sql = "DELETE FROM figures";
+    if ($id >= 0) {
+        $sql .= " WHERE id = '$id'";
+    }
+    $sql .= ";";
+
+    return 0 if $id < -1;
+
+    my $rows_deleted = $dbh->do($sql) or die $dbh->errstr;
+
+    return ($rows_deleted eq '0E0') ? 0 : $rows_deleted;
+}
+
+sub get_figure {
+    my $id = $_[0];
+    if (not $id) { return; }
+
+    my $sql = "SELECT type, points, color FROM figures WHERE id='$id';";
+
+    my $sth = $dbh->prepare($sql);
+    $sth->execute() or die $sth->errstr . "\n";
+
+    if (my @row = $sth->fetchrow_array()) {
+        my @points = split ',', $row[1];
+        return $row[0]->new(@points, $row[2]);
+    }
+}
+
+sub print_figures {
+    my $sql = "SELECT id, type, points, color FROM figures ORDER BY id;";
+    my $sth = $dbh->prepare($sql);
+    $sth->execute() or die $sth->errstr . "\n";
+
+    my $last_id;
+    while (my @row = $sth->fetchrow_array()) {
+        print sprintf("id %2d: $row[1] ", $row[0]);
+
+        my @points = split ',', $row[2];
+        for (my $i=0; $i<scalar @points; $i+=2) {
+            print "$points[$i],$points[$i+1] ";
+        }
+
+        print "$row[3]\n";
+
+        $last_id = $row[1];
+    }
+
+    if (not $last_id) {
+        print "Warning: No figures were found in the DB.\n";
+    }
+}
+
 ################################################################################
 package main;
 
-my $help = "Figure Render 1.0.0
+my $help = "Figure Render 2.0.0
 Usage: <command> [arguments [...]]
 
 Available commands:
 
-create  Creates and renders a new figure.
+create  Render a new figure, and then it's saved to DB.
 
         Sintax: create <figure type> <points> [color]
 
@@ -352,12 +487,29 @@ create  Creates and renders a new figure.
             create triangle -2,7 5,1 -3,-4 turquoise
             create circle -100.5,-100.5 10, 8
 
+list    Print all figures existing in the DB.
+
+render  Render a figure existing in the DB.
+
+        Sintax: render <figureID>
+
+drop    Remove a figure from the DB.
+
+        Sintax: drop <figureID>
+
+        If -1 is used as ID, all figures will be removed.
+
 help    Print this message.
 
 exit    Exit the program.
 ";
 
-my $create = sub {
+sub trim {
+    return if not $_[0];
+    $_[0] =~ s/^\s+|\s+$//g;
+};
+
+my $create_cmd = sub {
     my %figures = (
         figure   => "Figure",  rectangle => "Rectangle",
         square   => "Square",  circle    => "Circle",
@@ -385,7 +537,7 @@ my $create = sub {
                 "Type \"help\" for more information.\n";
         return;
     }
-    if (not defined $args[1]) {
+    if (not $args[1]) {
         print STDERR "Error: Figure type \"$args[0]\" requires arguments. " .
                 "Type \"help\" for more information.\n";
         return;
@@ -430,25 +582,71 @@ my $create = sub {
         $color = $sorted[$index];
     }
 
-    if (not eval {$figures{$type}->new(@points, $color)->render() }) {
+    eval {
+        my $figure = $figures{$type}->new(@points, $color);
+
+        DB::save_figure($figure);
+
+        $figure->render();
+    };
+
+    if ($@) {
         print STDERR $@;
+    }
+};
+
+my $validate_one_numeric_arg = sub {
+    trim($_[0]);
+
+    if (not defined $_[0]) {
+        print STDERR "Error: Command \"$_[1]\" requires a figure ID argument. " .
+                "Type \"help\" for more information.\n";
         return;
+    }
+
+    if (not $_[0] =~ /^[-+]?\d+$/) {
+        print STDERR "Error: The figure ID argument is just a numeric value.\n";
+        return;
+    }
+
+    return $_[0];
+};
+
+my $render_cmd = sub {
+    my $id = $_[0];
+
+    if (defined $validate_one_numeric_arg->($id, 'render')) {
+        my $figure = DB::get_figure($id);
+
+        if ($figure) {
+            $figure->render();
+        }
+        else {
+            print STDERR "Error: There is no figure in DB with ID \"$id\".\n";
+        }
+    }
+};
+
+my $drop_cmd = sub {
+    my $id = $_[0];
+
+    if (defined $validate_one_numeric_arg->($id, 'drop')) {
+        if (not DB::drop_figure($id)) {
+            print STDERR "Warning: There is no figure in DB with ID \"$id\".\n";
+        }
     }
 };
 
 my %commands = (
-    help   => sub { print "$help\n"; },
-    'exit' => sub { exit 0;          },
-    create => sub { $create->(@_);   }
+    create => sub { $create_cmd->(@_);   },
+    list   => sub { DB::print_figures(); },
+    render => sub { $render_cmd->(@_);   },
+    drop   => sub { $drop_cmd->(@_);     },
+    help   => sub { print "$help\n";     },
+    'exit' => sub { exit 0;              },
 );
 
-sub trim {
-    if (defined $_[0]) {
-        $_[0] =~ s/^\s+|\s+$//g;
-    }
-};
-
-print "Figure Render 1.0.0
+print "Figure Render 2.0.0
 Usage: <command> [arguments [...]]
 Type \"help\" for more information.\n";
 
